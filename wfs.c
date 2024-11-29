@@ -14,10 +14,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MAX_PATH_LEN 4096
-#define MAX_NAME_LEN 28
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define POINTERS_PER_BLOCK (BLOCK_SIZE / sizeof(int)) // 512 / 4 = 128 poijnter per ind. block
+#define POINTERS_PER_BLOCK (BLOCK_SIZE / sizeof(int)) // 512 / 4 = 128 pointers per indirect block
 
 // Global Variables
 void *disk_images[MAX_DISKS];
@@ -49,9 +47,10 @@ void split_path(const char *path, char *parent, char *name);
 int find_dentry(struct wfs_inode *dir_inode, const char *name, struct wfs_dentry *dentry);
 int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num);
 int remove_dentry(struct wfs_inode *dir_inode, const char *name);
-int read_indirect_block(int indirect_block_num, int *indirect_pointers); // New
-int write_indirect_block(int indirect_block_num, int *indirect_pointers); // New
-int allocate_indirect_block(struct wfs_inode *inode); // New
+int read_indirect_block(int indirect_block_num, int *indirect_pointers);
+int write_indirect_block(int indirect_block_num, int *indirect_pointers); 
+int allocate_indirect_block(struct wfs_inode *inode); 
+int initialize_root_directory();
 
 // FUSE Operations
 static int wfs_getattr(const char *path, struct stat *stbuf);
@@ -185,6 +184,12 @@ int wfs_init(char **disk_paths, int num_disks_input) {
     inode_bitmap = (uint8_t *)disk_images[0] + superblock->i_bitmap_ptr;
     data_bitmap = (uint8_t *)disk_images[0] + superblock->d_bitmap_ptr;
 
+    // Initialize root directory
+    if (initialize_root_directory() != 0) {
+        fprintf(stderr, "Error: Failed to initialize root directory.\n");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -249,17 +254,17 @@ int read_data_block(int block_num, void *buf) {
     } else if (raid_mode == 1) { // RAID 1
         memcpy(buf, (char *)disk_images[0] + offset, BLOCK_SIZE);
     } else if (raid_mode == 2) { // RAID 1v
-        char *blocks[MAX_DISKS];
+        char *blocks_data[MAX_DISKS];
         for (int d = 0; d < num_disks; d++) {
-            blocks[d] = malloc(BLOCK_SIZE);
-            if (blocks[d] == NULL) {
+            blocks_data[d] = malloc(BLOCK_SIZE);
+            if (blocks_data[d] == NULL) {
                 // Free previously allocated blocks
                 for (int k = 0; k < d; k++) {
-                    free(blocks[k]);
+                    free(blocks_data[k]);
                 }
                 return -ENOMEM;
             }
-            memcpy(blocks[d], (char *)disk_images[d] + offset, BLOCK_SIZE);
+            memcpy(blocks_data[d], (char *)disk_images[d] + offset, BLOCK_SIZE);
         }
         // Majority voting
         int majority_count = 0;
@@ -267,7 +272,7 @@ int read_data_block(int block_num, void *buf) {
         for (int i = 0; i < num_disks; i++) {
             int count = 1;
             for (int j = i + 1; j < num_disks; j++) {
-                if (memcmp(blocks[i], blocks[j], BLOCK_SIZE) == 0) {
+                if (memcmp(blocks_data[i], blocks_data[j], BLOCK_SIZE) == 0) {
                     count++;
                 }
             }
@@ -276,10 +281,10 @@ int read_data_block(int block_num, void *buf) {
                 majority_index = i;
             }
         }
-        memcpy(buf, blocks[majority_index], BLOCK_SIZE);
+        memcpy(buf, blocks_data[majority_index], BLOCK_SIZE);
         // Free blocks
         for (int d = 0; d < num_disks; d++) {
-            free(blocks[d]);
+            free(blocks_data[d]);
         }
     }
     return 0;
@@ -361,7 +366,7 @@ int write_indirect_block(int indirect_block_num, int *indirect_pointers) {
     return write_data_block(indirect_block_num, (void *)indirect_pointers);
 }
 
-// Allocate Indirect Block
+// Allocate Indirect Block (Only for regular files)
 int allocate_indirect_block(struct wfs_inode *inode) {
     if (inode->blocks[IND_BLOCK] != 0) {
         // Indirect block already allocated
@@ -411,8 +416,8 @@ void free_inode(int inode_num) {
         }
     }
 
-    // Free indirect blocks
-    if (inode.blocks[IND_BLOCK] != 0) {
+    // Free indirect blocks only if it's a regular file
+    if (!S_ISDIR(inode.mode) && inode.blocks[IND_BLOCK] != 0) {
         int indirect_pointers[POINTERS_PER_BLOCK];
         if (read_indirect_block(inode.blocks[IND_BLOCK], indirect_pointers) == 0) {
             for (int i = 0; i < POINTERS_PER_BLOCK; i++) {
@@ -446,6 +451,105 @@ void free_data_block(int block_num) {
         uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
         db[block_num / 8] = data_bitmap[block_num / 8];
     }
+}
+
+// Initialize Root Directory
+int initialize_root_directory() {
+    struct wfs_inode root_inode;
+    int res = read_inode(0, &root_inode);
+    if (res != 0) {
+        fprintf(stderr, "Error: Cannot read root inode.\n");
+        return -EIO;
+    }
+
+    // Check if root inode is a directory
+    if (!S_ISDIR(root_inode.mode)) {
+        fprintf(stderr, "Error: Root inode is not a directory.\n");
+        return -EIO;
+    }
+
+    // Check if root inode has an allocated data block
+    if (root_inode.blocks[0] == 0) {
+        // Allocate a data block for the root directory
+        int root_data_block = allocate_data_block();
+        if (root_data_block < 0) {
+            fprintf(stderr, "Error: Cannot allocate data block for root directory.\n");
+            return root_data_block; // -ENOSPC or other errors
+        }
+
+        // Initialize directory entries ('.' and '..')
+        struct wfs_dentry root_entries[2];
+        memset(root_entries, 0, sizeof(root_entries));
+
+        // '.' entry
+        strncpy(root_entries[0].name, ".", MAX_NAME_LEN);
+        root_entries[0].name[MAX_NAME_LEN - 1] = '\0';
+        root_entries[0].num = 0; // Inode 0
+
+        // '..' entry
+        strncpy(root_entries[1].name, "..", MAX_NAME_LEN);
+        root_entries[1].name[MAX_NAME_LEN - 1] = '\0';
+        root_entries[1].num = 0; // Inode 0
+
+        // Write directory entries to the data block
+        if (write_data_block(root_data_block, root_entries) != 0) {
+            fprintf(stderr, "Error: Cannot write root directory entries.\n");
+            free_data_block(root_data_block);
+            return -EIO;
+        }
+
+        // Update root inode's block pointer and size
+        root_inode.blocks[0] = root_data_block;
+        root_inode.size = sizeof(struct wfs_dentry) * 2; // Size of '.' and '..'
+        root_inode.mtim = time(NULL);
+        root_inode.ctim = time(NULL);
+
+        if (write_inode(&root_inode) != 0) {
+            fprintf(stderr, "Error: Cannot update root inode.\n");
+            free_data_block(root_data_block);
+            return -EIO;
+        }
+
+        printf("Root directory initialized successfully.\n");
+    } else {
+        // Root inode has an allocated data block; verify it contains '.' and '..'
+        struct wfs_dentry root_entries[2];
+        memset(root_entries, 0, sizeof(root_entries));
+
+        if (read_data_block(root_inode.blocks[0], root_entries) != 0) {
+            fprintf(stderr, "Error: Cannot read root directory data block.\n");
+            return -EIO;
+        }
+
+        // Check for '.' and '..' entries
+        int has_dot = 0, has_dotdot = 0;
+        for (int i = 0; i < 2; i++) {
+            if (strcmp(root_entries[i].name, ".") == 0 && root_entries[i].num == 0) {
+                has_dot = 1;
+            }
+            if (strcmp(root_entries[i].name, "..") == 0 && root_entries[i].num == 0) {
+                has_dotdot = 1;
+            }
+        }
+
+        if (!has_dot || !has_dotdot) {
+            fprintf(stderr, "Root directory missing '.' or '..' entries. Reinitializing.\n");
+            // Reinitialize root directory
+            free_data_block(root_inode.blocks[0]);
+            root_inode.blocks[0] = 0;
+            root_inode.size = 0;
+            root_inode.mtim = time(NULL);
+            root_inode.ctim = time(NULL);
+            if (write_inode(&root_inode) != 0) {
+                fprintf(stderr, "Error: Cannot reset root inode.\n");
+                return -EIO;
+            }
+            // Recursively call to allocate and initialize
+            return initialize_root_directory();
+        }
+    }
+
+    return 0; // Success
 }
 
 // Get Inode by Path
@@ -522,7 +626,7 @@ int find_dentry(struct wfs_inode *dir_inode, const char *name, struct wfs_dentry
         return -ENOTDIR;
     }
 
-    // Iterate over direct blocks
+    // Iterate over direct blocks only (no indirect blocks for directories)
     for (int i = 0; i < D_BLOCK; i++) {
         if (dir_inode->blocks[i] == 0) {
             continue;
@@ -545,37 +649,6 @@ int find_dentry(struct wfs_inode *dir_inode, const char *name, struct wfs_dentry
         }
     }
 
-    // Iterate over indirect blocks
-    if (dir_inode->blocks[IND_BLOCK] != 0) {
-        int indirect_pointers[POINTERS_PER_BLOCK];
-        int res = read_indirect_block(dir_inode->blocks[IND_BLOCK], indirect_pointers);
-        if (res != 0) {
-            return res;
-        }
-
-        for (int i = 0; i < POINTERS_PER_BLOCK; i++) {
-            if (indirect_pointers[i] == 0) {
-                continue;
-            }
-            char block[BLOCK_SIZE];
-            if (read_data_block(indirect_pointers[i], block) != 0) {
-                return -EIO;
-            }
-            struct wfs_dentry *entries = (struct wfs_dentry *)block;
-            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                if (entries[j].num == -1) {
-                    continue;
-                }
-                if (strncmp(entries[j].name, name, MAX_NAME_LEN) == 0) {
-                    if (dentry != NULL) {
-                        memcpy(dentry, &entries[j], sizeof(struct wfs_dentry));
-                    }
-                    return 0;
-                }
-            }
-        }
-    }
-
     return -ENOENT;
 }
 
@@ -592,7 +665,6 @@ int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
     new_entry.num = inode_num;
 
     int added = 0;
-    int res;
 
     // Iterate over direct blocks first
     for (int i = 0; i < D_BLOCK; i++) {
@@ -652,90 +724,8 @@ int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
     }
 
     if (!added) {
-        // Need to add entry via indirect block
-        if (dir_inode->blocks[IND_BLOCK] == 0) {
-            // Allocate indirect block
-            int new_indirect = allocate_indirect_block(dir_inode);
-            if (new_indirect < 0) {
-                return new_indirect; // -ENOSPC or other errors
-            }
-        }
-
-        // Read indirect block pointers
-        int indirect_pointers[POINTERS_PER_BLOCK];
-        res = read_indirect_block(dir_inode->blocks[IND_BLOCK], indirect_pointers);
-        if (res != 0) {
-            return res;
-        }
-
-        // Iterate over indirect pointers to find an empty block
-        for (int i = 0; i < POINTERS_PER_BLOCK; i++) {
-            if (indirect_pointers[i] == 0) {
-                // Allocate new data block
-                int block_num = allocate_data_block();
-                if (block_num < 0) {
-                    return block_num;
-                }
-                indirect_pointers[i] = block_num;
-
-                // Initialize the new block with all entries as -1
-                char block[BLOCK_SIZE];
-                memset(block, 0, BLOCK_SIZE);
-                struct wfs_dentry *entries = (struct wfs_dentry *)block;
-                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                    entries[j].num = -1;
-                }
-
-                // Add the new entry
-                entries[0] = new_entry;
-
-                // Write the new data block
-                if (write_data_block(block_num, block) != 0) {
-                    free_data_block(block_num);
-                    return -EIO;
-                }
-
-                // Write back the updated indirect block
-                res = write_indirect_block(dir_inode->blocks[IND_BLOCK], indirect_pointers);
-                if (res != 0) {
-                    free_data_block(block_num);
-                    return res;
-                }
-
-                if (write_inode(dir_inode) != 0) {
-                    return -EIO;
-                }
-
-                added = 1;
-                break;
-            } else {
-                // Check for empty entries in existing indirect blocks
-                char block[BLOCK_SIZE];
-                if (read_data_block(indirect_pointers[i], block) != 0) {
-                    return -EIO;
-                }
-                struct wfs_dentry *entries = (struct wfs_dentry *)block;
-                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                    if (entries[j].num == -1) {
-                        // Found empty slot; add new entry
-                        entries[j] = new_entry;
-                        if (write_data_block(indirect_pointers[i], block) != 0) {
-                            return -EIO;
-                        }
-                        added = 1;
-                        break;
-                    }
-                }
-                if (added) {
-                    break;
-                }
-            }
-        }
-
-        if (!added) {
-            // No space available
-            return -ENOSPC;
-        }
+        // No space available in direct blocks; cannot use indirect blocks for directories
+        return -ENOSPC;
     }
 
     return 0;
@@ -748,9 +738,8 @@ int remove_dentry(struct wfs_inode *dir_inode, const char *name) {
     }
 
     int removed = 0;
-    int res;
 
-    // Iterate over direct blocks
+    // Iterate over direct blocks only (no indirect blocks for directories)
     for (int i = 0; i < D_BLOCK; i++) {
         if (dir_inode->blocks[i] == 0) {
             continue;
@@ -779,67 +768,238 @@ int remove_dentry(struct wfs_inode *dir_inode, const char *name) {
     }
 
     if (!removed) {
-        // Check indirect blocks
-        if (dir_inode->blocks[IND_BLOCK] != 0) {
-            int indirect_pointers[POINTERS_PER_BLOCK];
-            res = read_indirect_block(dir_inode->blocks[IND_BLOCK], indirect_pointers);
-            if (res != 0) {
-                return res;
-            }
-
-            for (int i = 0; i < POINTERS_PER_BLOCK; i++) {
-                if (indirect_pointers[i] == 0) {
-                    continue;
-                }
-                char block[BLOCK_SIZE];
-                if (read_data_block(indirect_pointers[i], block) != 0) {
-                    return -EIO;
-                }
-                struct wfs_dentry *entries = (struct wfs_dentry *)block;
-                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                    if (entries[j].num == -1) {
-                        continue;
-                    }
-                    if (strncmp(entries[j].name, name, MAX_NAME_LEN) == 0) {
-                        entries[j].num = -1; // Mark as deleted
-                        if (write_data_block(indirect_pointers[i], block) != 0) {
-                            return -EIO;
-                        }
-                        removed = 1;
-                        break;
-                    }
-                }
-                if (removed) {
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!removed) {
         return -ENOENT;
     }
 
     return 0;
 }
 
-// Get Attribute
-static int wfs_getattr(const char *path, struct stat *stbuf) {
-    memset(stbuf, 0, sizeof(struct stat));
+// Read File
+static int wfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    (void) fi; // Unused
+
     struct wfs_inode inode;
     int res = get_inode_by_path(path, &inode);
     if (res != 0) {
         return res;
     }
 
-    stbuf->st_mode = inode.mode;
-    stbuf->st_nlink = inode.nlinks;
-    stbuf->st_uid = inode.uid;
-    stbuf->st_gid = inode.gid;
-    stbuf->st_size = inode.size;
-    stbuf->st_atime = inode.atim;
-    stbuf->st_mtime = inode.mtim;
-    stbuf->st_ctime = inode.ctim;
+    if (!S_ISREG(inode.mode)) {
+        return -EISDIR;
+    }
+
+    if (offset >= inode.size) {
+        return 0;
+    }
+
+    if (offset + size > inode.size) {
+        size = inode.size - offset;
+    }
+
+    size_t bytes_read = 0;
+    while (size > 0) {
+        int block_idx = offset / BLOCK_SIZE;
+        int block_offset = offset % BLOCK_SIZE;
+
+        off_t block_num;
+        if (block_idx < D_BLOCK) {
+            // Direct blocks
+            block_num = inode.blocks[block_idx];
+        } else {
+            // Indirect blocks
+            if (inode.blocks[IND_BLOCK] == 0) {
+                // Indirect block not allocated; treat as zeros
+                memset(buf + bytes_read, 0, MIN(BLOCK_SIZE - block_offset, size));
+                size -= MIN(BLOCK_SIZE - block_offset, size);
+                bytes_read += MIN(BLOCK_SIZE - block_offset, size);
+                offset += MIN(BLOCK_SIZE - block_offset, size);
+                continue;
+            }
+
+            // Read indirect block pointers
+            int indirect_pointers[POINTERS_PER_BLOCK];
+            res = read_indirect_block(inode.blocks[IND_BLOCK], indirect_pointers);
+            if (res != 0) {
+                return res;
+            }
+
+            int indirect_idx = block_idx - D_BLOCK;
+            if (indirect_idx >= POINTERS_PER_BLOCK) {
+                // Exceeds maximum file size supported
+                break;
+            }
+
+            block_num = indirect_pointers[indirect_idx];
+            if (block_num == 0) {
+                // Data block not allocated; treat as zeros
+                memset(buf + bytes_read, 0, MIN(BLOCK_SIZE - block_offset, size));
+                size -= MIN(BLOCK_SIZE - block_offset, size);
+                bytes_read += MIN(BLOCK_SIZE - block_offset, size);
+                offset += MIN(BLOCK_SIZE - block_offset, size);
+                continue;
+            }
+        }
+
+        if (block_num == 0) {
+            // Block not allocated; treat as zeros
+            memset(buf + bytes_read, 0, MIN(BLOCK_SIZE - block_offset, size));
+            size -= MIN(BLOCK_SIZE - block_offset, size);
+            bytes_read += MIN(BLOCK_SIZE - block_offset, size);
+            offset += MIN(BLOCK_SIZE - block_offset, size);
+            continue;
+        }
+
+        char block[BLOCK_SIZE];
+        res = read_data_block(block_num, block);
+        if (res != 0) {
+            return res;
+        }
+
+        size_t bytes_to_copy = MIN(BLOCK_SIZE - block_offset, size);
+        memcpy(buf + bytes_read, block + block_offset, bytes_to_copy);
+        bytes_read += bytes_to_copy;
+        offset += bytes_to_copy;
+        size -= bytes_to_copy;
+    }
+
+    return bytes_read;
+}
+
+// Write File
+static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    (void) fi; // Unused
+
+    struct wfs_inode inode;
+    int res = get_inode_by_path(path, &inode);
+    if (res != 0) {
+        return res;
+    }
+
+    if (!S_ISREG(inode.mode)) {
+        return -EISDIR;
+    }
+
+    size_t bytes_written = 0;
+    while (size > 0) {
+        int block_idx = offset / BLOCK_SIZE;
+        int block_offset = offset % BLOCK_SIZE;
+
+        off_t block_num;
+        if (block_idx < D_BLOCK) {
+            // Direct blocks
+            if (inode.blocks[block_idx] == 0) {
+                // Allocate a data block
+                int new_block = allocate_data_block();
+                if (new_block < 0) {
+                    return -ENOSPC;
+                }
+                inode.blocks[block_idx] = new_block;
+            }
+            block_num = inode.blocks[block_idx];
+        } else {
+            // Indirect blocks
+            int indirect_block_num = allocate_indirect_block(&inode);
+            if (indirect_block_num < 0) {
+                return indirect_block_num; // -ENOSPC or other errors
+            }
+
+            // Read indirect block pointers
+            int indirect_pointers[POINTERS_PER_BLOCK];
+            res = read_indirect_block(inode.blocks[IND_BLOCK], indirect_pointers);
+            if (res != 0) {
+                return res;
+            }
+
+            int indirect_idx = block_idx - D_BLOCK;
+            if (indirect_idx >= POINTERS_PER_BLOCK) {
+                // Exceeds maximum file size supported
+                return -ENOSPC;
+            }
+
+            if (indirect_pointers[indirect_idx] == 0) {
+                // Allocate a new data block
+                int new_block = allocate_data_block();
+                if (new_block < 0) {
+                    return -ENOSPC;
+                }
+                indirect_pointers[indirect_idx] = new_block;
+
+                // Write back the updated indirect block
+                res = write_indirect_block(inode.blocks[IND_BLOCK], indirect_pointers);
+                if (res != 0) {
+                    free_data_block(new_block);
+                    return res;
+                }
+            }
+
+            block_num = indirect_pointers[indirect_idx];
+        }
+
+        char block[BLOCK_SIZE];
+        if (read_data_block(block_num, block) != 0) {
+            return -EIO;
+        }
+
+        size_t bytes_to_copy = MIN(BLOCK_SIZE - block_offset, size);
+        memcpy(block + block_offset, buf + bytes_written, bytes_to_copy);
+
+        if (write_data_block(block_num, block) != 0) {
+            return -EIO;
+        }
+
+        bytes_written += bytes_to_copy;
+        offset += bytes_to_copy;
+        size -= bytes_to_copy;
+    }
+
+    // Update inode size if needed
+    if (offset > inode.size) {
+        inode.size = offset;
+    }
+    inode.mtim = time(NULL);
+    res = write_inode(&inode);
+    if (res != 0) {
+        return res;
+    }
+
+    return bytes_written;
+}
+
+// Read Directory
+static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+    (void) offset;
+    (void) fi;
+
+    struct wfs_inode dir_inode;
+    int res = get_inode_by_path(path, &dir_inode);
+    if (res != 0) {
+        return res;
+    }
+
+    if (!S_ISDIR(dir_inode.mode)) {
+        return -ENOTDIR;
+    }
+
+    // Add '.' and '..' entries
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
+    // Iterate over direct blocks only (no indirect blocks for directories)
+    for (int i = 0; i < D_BLOCK; i++) {
+        if (dir_inode.blocks[i] == 0) {
+            continue;
+        }
+        char block[BLOCK_SIZE];
+        if (read_data_block(dir_inode.blocks[i], block) != 0) {
+            return -EIO;
+        }
+        struct wfs_dentry *entries = (struct wfs_dentry *)block;
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+            if (entries[j].num != -1) {
+                filler(buf, entries[j].name, NULL, 0);
+            }
+        }
+    }
 
     return 0;
 }
@@ -1051,7 +1211,7 @@ static int wfs_rmdir(const char *path) {
     // Check if directory is empty (excluding '.' and '..')
     int is_empty = 1;
     // Iterate over direct blocks
-    for (int i = 0; i < D_BLOCK; i++) {
+    for (int i = 0; i < D_BLOCK && is_empty; i++) {
         if (dir_inode.blocks[i] == 0) {
             continue;
         }
@@ -1064,32 +1224,6 @@ static int wfs_rmdir(const char *path) {
             if (entries[j].num != -1 && strcmp(entries[j].name, ".") != 0 && strcmp(entries[j].name, "..") != 0) {
                 is_empty = 0;
                 break;
-            }
-        }
-        if (!is_empty) {
-            break;
-        }
-    }
-
-    // Iterate over indirect blocks
-    if (is_empty && dir_inode.blocks[IND_BLOCK] != 0) {
-        int indirect_pointers[POINTERS_PER_BLOCK];
-        res = read_indirect_block(dir_inode.blocks[IND_BLOCK], indirect_pointers);
-        if (res == 0) {
-            for (int i = 0; i < POINTERS_PER_BLOCK && is_empty; i++) {
-                if (indirect_pointers[i] != 0) {
-                    char block[BLOCK_SIZE];
-                    if (read_data_block(indirect_pointers[i], block) != 0) {
-                        return -EIO;
-                    }
-                    struct wfs_dentry *entries = (struct wfs_dentry *)block;
-                    for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                        if (entries[j].num != -1 && strcmp(entries[j].name, ".") != 0 && strcmp(entries[j].name, "..") != 0) {
-                            is_empty = 0;
-                            break;
-                        }
-                    }
-                }
             }
         }
     }
@@ -1114,256 +1248,23 @@ static int wfs_rmdir(const char *path) {
     return 0;
 }
 
-// Read File
-static int wfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-    (void) fi; // Unused
-
+// Get Attribute
+static int wfs_getattr(const char *path, struct stat *stbuf) {
+    memset(stbuf, 0, sizeof(struct stat));
     struct wfs_inode inode;
     int res = get_inode_by_path(path, &inode);
     if (res != 0) {
         return res;
     }
 
-    if (!S_ISREG(inode.mode)) {
-        return -EISDIR;
-    }
-
-    if (offset >= inode.size) {
-        return 0;
-    }
-
-    if (offset + size > inode.size) {
-        size = inode.size - offset;
-    }
-
-    size_t bytes_read = 0;
-    while (size > 0) {
-        int block_idx = offset / BLOCK_SIZE;
-        int block_offset = offset % BLOCK_SIZE;
-
-        off_t block_num;
-        if (block_idx < D_BLOCK) {
-            // Direct blocks
-            block_num = inode.blocks[block_idx];
-        } else {
-            // Indirect blocks
-            if (inode.blocks[IND_BLOCK] == 0) {
-                // Indirect block not allocated; treat as zeros
-                memset(buf + bytes_read, 0, MIN(BLOCK_SIZE - block_offset, size));
-                size -= MIN(BLOCK_SIZE - block_offset, size);
-                offset += MIN(BLOCK_SIZE - block_offset, size);
-                bytes_read += MIN(BLOCK_SIZE - block_offset, size);
-                continue;
-            }
-
-            // Read indirect block pointers
-            int indirect_pointers[POINTERS_PER_BLOCK];
-            res = read_indirect_block(inode.blocks[IND_BLOCK], indirect_pointers);
-            if (res != 0) {
-                return res;
-            }
-
-            int indirect_idx = block_idx - D_BLOCK;
-            if (indirect_idx >= POINTERS_PER_BLOCK) {
-                // Exceeds maximum file size supported
-                break;
-            }
-
-            block_num = indirect_pointers[indirect_idx];
-            if (block_num == 0) {
-                // Data block not allocated; treat as zeros
-                memset(buf + bytes_read, 0, MIN(BLOCK_SIZE - block_offset, size));
-                size -= MIN(BLOCK_SIZE - block_offset, size);
-                offset += MIN(BLOCK_SIZE - block_offset, size);
-                bytes_read += MIN(BLOCK_SIZE - block_offset, size);
-                continue;
-            }
-        }
-
-        if (block_num == 0) {
-            // Block not allocated; treat as zeros
-            memset(buf + bytes_read, 0, MIN(BLOCK_SIZE - block_offset, size));
-            size -= MIN(BLOCK_SIZE - block_offset, size);
-            offset += MIN(BLOCK_SIZE - block_offset, size);
-            bytes_read += MIN(BLOCK_SIZE - block_offset, size);
-            continue;
-        }
-
-        char block[BLOCK_SIZE];
-        res = read_data_block(block_num, block);
-        if (res != 0) {
-            return res;
-        }
-
-        size_t bytes_to_copy = MIN(BLOCK_SIZE - block_offset, size);
-        memcpy(buf + bytes_read, block + block_offset, bytes_to_copy);
-        bytes_read += bytes_to_copy;
-        offset += bytes_to_copy;
-        size -= bytes_to_copy;
-    }
-
-    return bytes_read;
-}
-
-// Write File
-static int wfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-    (void) fi; // Unused
-
-    struct wfs_inode inode;
-    int res = get_inode_by_path(path, &inode);
-    if (res != 0) {
-        return res;
-    }
-
-    if (!S_ISREG(inode.mode)) {
-        return -EISDIR;
-    }
-
-    size_t bytes_written = 0;
-    while (size > 0) {
-        int block_idx = offset / BLOCK_SIZE;
-        int block_offset = offset % BLOCK_SIZE;
-
-        off_t block_num;
-        if (block_idx < D_BLOCK) {
-            // Direct blocks
-            if (inode.blocks[block_idx] == 0) {
-                // Allocate a data block
-                int new_block = allocate_data_block();
-                if (new_block < 0) {
-                    return -ENOSPC;
-                }
-                inode.blocks[block_idx] = new_block;
-            }
-            block_num = inode.blocks[block_idx];
-        } else {
-            // Indirect blocks
-            int indirect_block_num = allocate_indirect_block(&inode);
-            if (indirect_block_num < 0) {
-                return indirect_block_num; // -ENOSPC or other errors
-            }
-
-            // Read indirect block pointers
-            int indirect_pointers[POINTERS_PER_BLOCK];
-            res = read_indirect_block(inode.blocks[IND_BLOCK], indirect_pointers);
-            if (res != 0) {
-                return res;
-            }
-
-            int indirect_idx = block_idx - D_BLOCK;
-            if (indirect_idx >= POINTERS_PER_BLOCK) {
-                // Exceeds maximum file size supported
-                return -ENOSPC;
-            }
-
-            if (indirect_pointers[indirect_idx] == 0) {
-                // Allocate a new data block
-                int new_block = allocate_data_block();
-                if (new_block < 0) {
-                    return -ENOSPC;
-                }
-                indirect_pointers[indirect_idx] = new_block;
-
-                // Write back the updated indirect block
-                res = write_indirect_block(inode.blocks[IND_BLOCK], indirect_pointers);
-                if (res != 0) {
-                    free_data_block(new_block);
-                    return res;
-                }
-            }
-
-            block_num = indirect_pointers[indirect_idx];
-        }
-
-        char block[BLOCK_SIZE];
-        if (read_data_block(block_num, block) != 0) {
-            return -EIO;
-        }
-
-        size_t bytes_to_copy = MIN(BLOCK_SIZE - block_offset, size);
-        memcpy(block + block_offset, buf + bytes_written, bytes_to_copy);
-
-        if (write_data_block(block_num, block) != 0) {
-            return -EIO;
-        }
-
-        bytes_written += bytes_to_copy;
-        offset += bytes_to_copy;
-        size -= bytes_to_copy;
-    }
-
-    // Update inode size if needed
-    if (offset > inode.size) {
-        inode.size = offset;
-    }
-    inode.mtim = time(NULL);
-    res = write_inode(&inode);
-    if (res != 0) {
-        return res;
-    }
-
-    return bytes_written;
-}
-
-// Read Directory
-static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
-    (void) offset;
-    (void) fi;
-
-    struct wfs_inode dir_inode;
-    int res = get_inode_by_path(path, &dir_inode);
-    if (res != 0) {
-        return res;
-    }
-
-    if (!S_ISDIR(dir_inode.mode)) {
-        return -ENOTDIR;
-    }
-
-    filler(buf, ".", NULL, 0);
-    filler(buf, "..", NULL, 0);
-
-    // Iterate over direct blocks
-    for (int i = 0; i < D_BLOCK; i++) {
-        if (dir_inode.blocks[i] == 0) {
-            continue;
-        }
-        char block[BLOCK_SIZE];
-        if (read_data_block(dir_inode.blocks[i], block) != 0) {
-            return -EIO;
-        }
-        struct wfs_dentry *entries = (struct wfs_dentry *)block;
-        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-            if (entries[j].num != -1) {
-                filler(buf, entries[j].name, NULL, 0);
-            }
-        }
-    }
-
-    // Iterate over indirect blocks
-    if (dir_inode.blocks[IND_BLOCK] != 0) {
-        int indirect_pointers[POINTERS_PER_BLOCK];
-        res = read_indirect_block(dir_inode.blocks[IND_BLOCK], indirect_pointers);
-        if (res != 0) {
-            return res;
-        }
-
-        for (int i = 0; i < POINTERS_PER_BLOCK; i++) {
-            if (indirect_pointers[i] == 0) {
-                continue;
-            }
-            char block[BLOCK_SIZE];
-            if (read_data_block(indirect_pointers[i], block) != 0) {
-                return -EIO;
-            }
-            struct wfs_dentry *entries = (struct wfs_dentry *)block;
-            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                if (entries[j].num != -1) {
-                    filler(buf, entries[j].name, NULL, 0);
-                }
-            }
-        }
-    }
+    stbuf->st_mode = inode.mode;
+    stbuf->st_nlink = inode.nlinks;
+    stbuf->st_uid = inode.uid;
+    stbuf->st_gid = inode.gid;
+    stbuf->st_size = inode.size;
+    stbuf->st_atime = inode.atim;
+    stbuf->st_mtime = inode.mtim;
+    stbuf->st_ctime = inode.ctim;
 
     return 0;
 }

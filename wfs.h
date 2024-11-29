@@ -11,6 +11,9 @@
 #define INODE_SIZE BLOCK_SIZE // Each inode is 512 bytes/1 blocks
 #define MAX_DISKS 10          // Maximum number of disks (from piazza post)
 
+#define MAX_PATH_LEN 4096
+#define MAX_NAME_LEN 28
+
 /*
   The fields in the superblock should reflect the structure of the filesystem.
   `mkfs` writes the superblock to offset 0 of the disk image. 
