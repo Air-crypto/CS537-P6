@@ -640,6 +640,7 @@ int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
         return -ENOTDIR;
     }
 
+    // Create the new directory entry
     struct wfs_dentry new_entry;
     memset(&new_entry, 0, sizeof(struct wfs_dentry));
     strncpy(new_entry.name, name, MAX_NAME_LEN);
@@ -648,112 +649,70 @@ int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
 
     int added = 0;
 
-    // Check if directory has any data blocks allocated
-    int has_blocks = 0;
+    // First try to add to existing blocks
     for (int i = 0; i < D_BLOCK; i++) {
-        if (dir_inode->blocks[i] != 0) {
-            has_blocks = 1;
+        if (dir_inode->blocks[i] == 0) {
+            continue;
+        }
+        char block[BLOCK_SIZE];
+        if (read_data_block(dir_inode->blocks[i], block) != 0) {
+            return -EIO;
+        }
+        struct wfs_dentry *entries = (struct wfs_dentry *)block;
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+            if (entries[j].num == -1) {
+                // Found empty slot; add new entry
+                entries[j] = new_entry;
+                if (write_data_block(dir_inode->blocks[i], block) != 0) {
+                    return -EIO;
+                }
+                added = 1;
+                break;
+            }
+        }
+        if (added) {
             break;
         }
     }
 
-    // If no blocks allocated, allocate one now
-    if (!has_blocks) {
-        int block_num = allocate_data_block();
-        if (block_num < 0) {
-            return block_num;
-        }
-        dir_inode->blocks[0] = block_num;
-        dir_inode->size += BLOCK_SIZE;
-
-        // Initialize block with all entries as -1
-        char block[BLOCK_SIZE];
-        memset(block, 0, BLOCK_SIZE);
-        struct wfs_dentry *entries = (struct wfs_dentry *)block;
-        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-            entries[j].num = -1;
-        }
-
-        // Add the new entry
-        entries[0] = new_entry;
-
-        if (write_data_block(block_num, block) != 0) {
-            free_data_block(block_num);
-            return -EIO;
-        }
-
-        if (write_inode(dir_inode) != 0) {
-            return -EIO;
-        }
-
-        added = 1;
-    } else {
-        // Iterate over direct blocks
+    // Only allocate new block if necessary
+    if (!added) {
         for (int i = 0; i < D_BLOCK; i++) {
             if (dir_inode->blocks[i] == 0) {
-                continue;
-            }
-            char block[BLOCK_SIZE];
-            if (read_data_block(dir_inode->blocks[i], block) != 0) {
-                return -EIO;
-            }
-            struct wfs_dentry *entries = (struct wfs_dentry *)block;
-            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                if (entries[j].num == -1) {
-                    // Found empty slot; add new entry
-                    entries[j] = new_entry;
-                    if (write_data_block(dir_inode->blocks[i], block) != 0) {
-                        return -EIO;
-                    }
-                    added = 1;
-                    break;
+                int block_num = allocate_data_block();
+                if (block_num < 0) {
+                    return block_num;
                 }
-            }
-            if (added) {
+                dir_inode->blocks[i] = block_num;
+                dir_inode->size += BLOCK_SIZE;
+
+                // Initialize block with all entries as -1
+                char block[BLOCK_SIZE];
+                memset(block, 0, BLOCK_SIZE);
+                struct wfs_dentry *entries = (struct wfs_dentry *)block;
+                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+                    entries[j].num = -1;
+                }
+
+                // Add the new entry
+                entries[0] = new_entry;
+
+                if (write_data_block(block_num, block) != 0) {
+                    free_data_block(block_num);
+                    return -EIO;
+                }
+
+                if (write_inode(dir_inode) != 0) {
+                    return -EIO;
+                }
+
+                added = 1;
                 break;
-            }
-        }
-
-        if (!added) {
-            // No space available in existing blocks, allocate a new block
-            for (int i = 0; i < D_BLOCK; i++) {
-                if (dir_inode->blocks[i] == 0) {
-                    int block_num = allocate_data_block();
-                    if (block_num < 0) {
-                        return block_num;
-                    }
-                    dir_inode->blocks[i] = block_num;
-                    dir_inode->size += BLOCK_SIZE;
-
-                    // Initialize block with all entries as -1
-                    char block[BLOCK_SIZE];
-                    memset(block, 0, BLOCK_SIZE);
-                    struct wfs_dentry *entries = (struct wfs_dentry *)block;
-                    for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                        entries[j].num = -1;
-                    }
-
-                    // Add the new entry
-                    entries[0] = new_entry;
-
-                    if (write_data_block(block_num, block) != 0) {
-                        free_data_block(block_num);
-                        return -EIO;
-                    }
-
-                    if (write_inode(dir_inode) != 0) {
-                        return -EIO;
-                    }
-
-                    added = 1;
-                    break;
-                }
             }
         }
     }
 
     if (!added) {
-        // No space available in direct blocks
         return -ENOSPC;
     }
 
