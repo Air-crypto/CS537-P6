@@ -491,15 +491,6 @@ int initialize_root_directory() {
             entries[j].num = -1;
         }
 
-        // Add '.' and '..' entries at the beginning
-        strncpy(entries[0].name, ".", MAX_NAME_LEN);
-        entries[0].name[MAX_NAME_LEN - 1] = '\0';
-        entries[0].num = 0;  // Root inode
-
-        strncpy(entries[1].name, "..", MAX_NAME_LEN);
-        entries[1].name[MAX_NAME_LEN - 1] = '\0';
-        entries[1].num = 0;  // Also root inode for root directory
-
         if (write_data_block(block_num, block) != 0) {
             fprintf(stderr, "Error: Cannot write root directory entries.\n");
             free_data_block(block_num);
@@ -1009,10 +1000,11 @@ static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         }
     }
 
+    // Even an empty directory should have "." and ".." entries
+    filler(buf, ".", NULL, 0);
+    filler(buf, "..", NULL, 0);
+
     if (!has_blocks) {
-        // Even an empty directory should have "." and ".." entries
-        filler(buf, ".", NULL, 0);
-        filler(buf, "..", NULL, 0);
         return 0;
     }
 
