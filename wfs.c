@@ -468,85 +468,52 @@ int initialize_root_directory() {
         return -EIO;
     }
 
-    // Check if root inode has an allocated data block
+    // Allocate a data block for the root directory if not already allocated
     if (root_inode.blocks[0] == 0) {
-        // Allocate a data block for the root directory
-        int root_data_block = allocate_data_block();
-        if (root_data_block < 0) {
+        int block_num = allocate_data_block();
+        if (block_num < 0) {
             fprintf(stderr, "Error: Cannot allocate data block for root directory.\n");
-            return root_data_block; // -ENOSPC or other errors
+            return block_num;
+        }
+        root_inode.blocks[0] = block_num;
+        root_inode.size = BLOCK_SIZE;
+
+        // Initialize block with all entries as -1
+        char block[BLOCK_SIZE];
+        memset(block, 0, BLOCK_SIZE);
+        struct wfs_dentry *entries = (struct wfs_dentry *)block;
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+            entries[j].num = -1;
         }
 
-        // Initialize directory entries ('.' and '..')
-        struct wfs_dentry root_entries[2];
-        memset(root_entries, 0, sizeof(root_entries));
-
+        // Add '.' and '..' entries
         // '.' entry
-        strncpy(root_entries[0].name, ".", MAX_NAME_LEN);
-        root_entries[0].name[MAX_NAME_LEN - 1] = '\0';
-        root_entries[0].num = 0; // Inode 0
+        strncpy(entries[0].name, ".", MAX_NAME_LEN);
+        entries[0].name[MAX_NAME_LEN - 1] = '\0';
+        entries[0].num = 0; // Inode 0
 
         // '..' entry
-        strncpy(root_entries[1].name, "..", MAX_NAME_LEN);
-        root_entries[1].name[MAX_NAME_LEN - 1] = '\0';
-        root_entries[1].num = 0; // Inode 0
+        strncpy(entries[1].name, "..", MAX_NAME_LEN);
+        entries[1].name[MAX_NAME_LEN - 1] = '\0';
+        entries[1].num = 0; // Inode 0
 
-        // Write directory entries to the data block
-        if (write_data_block(root_data_block, root_entries) != 0) {
+        if (write_data_block(block_num, block) != 0) {
             fprintf(stderr, "Error: Cannot write root directory entries.\n");
-            free_data_block(root_data_block);
+            free_data_block(block_num);
             return -EIO;
         }
 
-        // Update root inode's block pointer and size
-        root_inode.blocks[0] = root_data_block;
-        root_inode.size = sizeof(struct wfs_dentry) * 2; // Size of '.' and '..'
+        root_inode.nlinks = 2; // '.' and '..'
         root_inode.mtim = time(NULL);
         root_inode.ctim = time(NULL);
 
         if (write_inode(&root_inode) != 0) {
             fprintf(stderr, "Error: Cannot update root inode.\n");
-            free_data_block(root_data_block);
+            free_data_block(block_num);
             return -EIO;
         }
 
         printf("Root directory initialized successfully.\n");
-    } else {
-        // Root inode has an allocated data block; verify it contains '.' and '..'
-        struct wfs_dentry root_entries[2];
-        memset(root_entries, 0, sizeof(root_entries));
-
-        if (read_data_block(root_inode.blocks[0], root_entries) != 0) {
-            fprintf(stderr, "Error: Cannot read root directory data block.\n");
-            return -EIO;
-        }
-
-        // Check for '.' and '..' entries
-        int has_dot = 0, has_dotdot = 0;
-        for (int i = 0; i < 2; i++) {
-            if (strcmp(root_entries[i].name, ".") == 0 && root_entries[i].num == 0) {
-                has_dot = 1;
-            }
-            if (strcmp(root_entries[i].name, "..") == 0 && root_entries[i].num == 0) {
-                has_dotdot = 1;
-            }
-        }
-
-        if (!has_dot || !has_dotdot) {
-            fprintf(stderr, "Root directory missing '.' or '..' entries. Reinitializing.\n");
-            // Reinitialize root directory
-            free_data_block(root_inode.blocks[0]);
-            root_inode.blocks[0] = 0;
-            root_inode.size = 0;
-            root_inode.mtim = time(NULL);
-            root_inode.ctim = time(NULL);
-            if (write_inode(&root_inode) != 0) {
-                fprintf(stderr, "Error: Cannot reset root inode.\n");
-                return -EIO;
-            }
-            // Recursively call to allocate and initialize
-            return initialize_root_directory();
-        }
     }
 
     return 0; // Success
@@ -564,15 +531,17 @@ int get_inode_by_path(const char *path, struct wfs_inode *inode) {
         return -ENOMEM;
     }
 
-    char *token;
     char *rest = path_copy;
+    // Skip leading slashes
+    while (*rest == '/') rest++;
+
     struct wfs_inode current_inode;
     if (read_inode(0, &current_inode) != 0) {
         free(path_copy);
         return -ENOENT;
     }
 
-    token = strtok_r(rest, "/", &rest);
+    char *token = strtok_r(rest, "/", &rest);
     while (token != NULL) {
         if (!S_ISDIR(current_inode.mode)) {
             free(path_copy);
@@ -620,13 +589,26 @@ void split_path(const char *path, char *parent, char *name) {
     }
 }
 
-// Find Directory Entry
+// Adjusted find_dentry function
 int find_dentry(struct wfs_inode *dir_inode, const char *name, struct wfs_dentry *dentry) {
     if (!S_ISDIR(dir_inode->mode)) {
         return -ENOTDIR;
     }
 
-    // Iterate over direct blocks only (no indirect blocks for directories)
+    // If directory has no data blocks, it is empty
+    int has_blocks = 0;
+    for (int i = 0; i < D_BLOCK; i++) {
+        if (dir_inode->blocks[i] != 0) {
+            has_blocks = 1;
+            break;
+        }
+    }
+
+    if (!has_blocks) {
+        return -ENOENT;
+    }
+
+    // Iterate over direct blocks
     for (int i = 0; i < D_BLOCK; i++) {
         if (dir_inode->blocks[i] == 0) {
             continue;
@@ -652,7 +634,7 @@ int find_dentry(struct wfs_inode *dir_inode, const char *name, struct wfs_dentry
     return -ENOENT;
 }
 
-// Add Directory Entry
+// Adjusted add_dentry function
 int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
     if (!S_ISDIR(dir_inode->mode)) {
         return -ENOTDIR;
@@ -666,41 +648,51 @@ int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
 
     int added = 0;
 
-    // Iterate over direct blocks first
+    // Check if directory has any data blocks allocated
+    int has_blocks = 0;
     for (int i = 0; i < D_BLOCK; i++) {
-        if (dir_inode->blocks[i] == 0) {
-            // Allocate a new data block
-            int block_num = allocate_data_block();
-            if (block_num < 0) {
-                return block_num;
-            }
-            dir_inode->blocks[i] = block_num;
-            dir_inode->size += BLOCK_SIZE;
-
-            // Initialize block with all entries as -1
-            char block[BLOCK_SIZE];
-            memset(block, 0, BLOCK_SIZE);
-            struct wfs_dentry *entries = (struct wfs_dentry *)block;
-            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                entries[j].num = -1;
-            }
-
-            // Add the new entry
-            entries[0] = new_entry;
-
-            if (write_data_block(block_num, block) != 0) {
-                free_data_block(block_num);
-                return -EIO;
-            }
-
-            if (write_inode(dir_inode) != 0) {
-                return -EIO;
-            }
-
-            added = 1;
+        if (dir_inode->blocks[i] != 0) {
+            has_blocks = 1;
             break;
-        } else {
-            // Check for empty entries in existing blocks
+        }
+    }
+
+    // If no blocks allocated, allocate one now
+    if (!has_blocks) {
+        int block_num = allocate_data_block();
+        if (block_num < 0) {
+            return block_num;
+        }
+        dir_inode->blocks[0] = block_num;
+        dir_inode->size += BLOCK_SIZE;
+
+        // Initialize block with all entries as -1
+        char block[BLOCK_SIZE];
+        memset(block, 0, BLOCK_SIZE);
+        struct wfs_dentry *entries = (struct wfs_dentry *)block;
+        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+            entries[j].num = -1;
+        }
+
+        // Add the new entry
+        entries[0] = new_entry;
+
+        if (write_data_block(block_num, block) != 0) {
+            free_data_block(block_num);
+            return -EIO;
+        }
+
+        if (write_inode(dir_inode) != 0) {
+            return -EIO;
+        }
+
+        added = 1;
+    } else {
+        // Iterate over direct blocks
+        for (int i = 0; i < D_BLOCK; i++) {
+            if (dir_inode->blocks[i] == 0) {
+                continue;
+            }
             char block[BLOCK_SIZE];
             if (read_data_block(dir_inode->blocks[i], block) != 0) {
                 return -EIO;
@@ -721,10 +713,47 @@ int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
                 break;
             }
         }
+
+        if (!added) {
+            // No space available in existing blocks, allocate a new block
+            for (int i = 0; i < D_BLOCK; i++) {
+                if (dir_inode->blocks[i] == 0) {
+                    int block_num = allocate_data_block();
+                    if (block_num < 0) {
+                        return block_num;
+                    }
+                    dir_inode->blocks[i] = block_num;
+                    dir_inode->size += BLOCK_SIZE;
+
+                    // Initialize block with all entries as -1
+                    char block[BLOCK_SIZE];
+                    memset(block, 0, BLOCK_SIZE);
+                    struct wfs_dentry *entries = (struct wfs_dentry *)block;
+                    for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+                        entries[j].num = -1;
+                    }
+
+                    // Add the new entry
+                    entries[0] = new_entry;
+
+                    if (write_data_block(block_num, block) != 0) {
+                        free_data_block(block_num);
+                        return -EIO;
+                    }
+
+                    if (write_inode(dir_inode) != 0) {
+                        return -EIO;
+                    }
+
+                    added = 1;
+                    break;
+                }
+            }
+        }
     }
 
     if (!added) {
-        // No space available in direct blocks; cannot use indirect blocks for directories
+        // No space available in direct blocks
         return -ENOSPC;
     }
 
@@ -965,7 +994,7 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
     return bytes_written;
 }
 
-// Read Directory
+// Adjusted wfs_readdir function
 static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
     (void) offset;
     (void) fi;
@@ -984,7 +1013,21 @@ static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
 
-    // Iterate over direct blocks only (no indirect blocks for directories)
+    // Check if directory has data blocks
+    int has_blocks = 0;
+    for (int i = 0; i < D_BLOCK; i++) {
+        if (dir_inode.blocks[i] != 0) {
+            has_blocks = 1;
+            break;
+        }
+    }
+
+    if (!has_blocks) {
+        // Empty directory
+        return 0;
+    }
+
+    // Iterate over direct blocks
     for (int i = 0; i < D_BLOCK; i++) {
         if (dir_inode.blocks[i] == 0) {
             continue;
@@ -1064,7 +1107,7 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t dev) {
     return 0;
 }
 
-// Create Directory
+// Adjusted wfs_mkdir function
 static int wfs_mkdir(const char *path, mode_t mode) {
     char parent_path[MAX_PATH_LEN];
     char name[MAX_NAME_LEN];
@@ -1099,7 +1142,7 @@ static int wfs_mkdir(const char *path, mode_t mode) {
     new_inode.mode = mode | S_IFDIR;
     new_inode.uid = getuid();
     new_inode.gid = getgid();
-    new_inode.size = 0;
+    new_inode.size = 0; // No data blocks allocated yet
     new_inode.nlinks = 2; // For '.' and '..'
     time_t now = time(NULL);
     new_inode.atim = now;
@@ -1118,7 +1161,7 @@ static int wfs_mkdir(const char *path, mode_t mode) {
     }
 
     // Update parent inode
-    parent_inode.nlinks++; // Increase link count
+    parent_inode.nlinks++; // Increase link count for new subdirectory
     parent_inode.mtim = now;
     write_inode(&parent_inode);
 
