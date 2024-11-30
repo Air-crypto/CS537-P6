@@ -329,7 +329,8 @@ int allocate_inode() {
 
 // Allocate Data Block
 int allocate_data_block() {
-    for (int i = 0; i < num_data_blocks; i++) {
+    // Start from 1 to avoid using block 0, but go up to and including num_data_blocks
+    for (int i = 1; i <= num_data_blocks; i++) {
         uint8_t byte = data_bitmap[i / 8];
         if ((byte & (1 << (i % 8))) == 0) {
             // Mark data block as allocated
@@ -339,6 +340,7 @@ int allocate_data_block() {
                 uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
                 db[i / 8] = data_bitmap[i / 8];
             }
+            printf("Allocated data block %d\n", i);  // Debug output
             return i;
         }
     }
@@ -476,26 +478,27 @@ int initialize_root_directory() {
             return block_num;
         }
         root_inode.blocks[0] = block_num;
+        // We'll set size to BLOCK_SIZE since we're using one full block
         root_inode.size = BLOCK_SIZE;
 
-        // Initialize block with all entries as -1
+        // Initialize block with all entries marked as available (-1)
         char block[BLOCK_SIZE];
         memset(block, 0, BLOCK_SIZE);
         struct wfs_dentry *entries = (struct wfs_dentry *)block;
+        
+        // Mark all entries as available
         for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
             entries[j].num = -1;
         }
 
-        // Add '.' and '..' entries
-        // '.' entry
+        // Add '.' and '..' entries at the beginning
         strncpy(entries[0].name, ".", MAX_NAME_LEN);
         entries[0].name[MAX_NAME_LEN - 1] = '\0';
-        entries[0].num = 0; // Inode 0
+        entries[0].num = 0;  // Root inode
 
-        // '..' entry
         strncpy(entries[1].name, "..", MAX_NAME_LEN);
         entries[1].name[MAX_NAME_LEN - 1] = '\0';
-        entries[1].num = 0; // Inode 0
+        entries[1].num = 0;  // Also root inode for root directory
 
         if (write_data_block(block_num, block) != 0) {
             fprintf(stderr, "Error: Cannot write root directory entries.\n");
@@ -503,7 +506,7 @@ int initialize_root_directory() {
             return -EIO;
         }
 
-        root_inode.nlinks = 2; // '.' and '..'
+        root_inode.nlinks = 2;  // '.' and '..'
         root_inode.mtim = time(NULL);
         root_inode.ctim = time(NULL);
 
@@ -513,10 +516,12 @@ int initialize_root_directory() {
             return -EIO;
         }
 
-        printf("Root directory initialized successfully.\n");
+        printf("Root directory initialized with size %ld bytes\n", root_inode.size);
+
+        printf("Root directory initialized: inode 0, block %ld, size %ld\n", root_inode.blocks[0], root_inode.size);
     }
 
-    return 0; // Success
+    return 0;
 }
 
 // Get Inode by Path
@@ -634,9 +639,17 @@ int find_dentry(struct wfs_inode *dir_inode, const char *name, struct wfs_dentry
     return -ENOENT;
 }
 
-// Adjusted add_dentry function
+// Add directory entry
 int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
+    printf("\nAdd_dentry: Starting to add entry '%s' (inode %d)\n", name, inode_num);
+    printf("Add_dentry: Parent inode number: %d\n", dir_inode->num);
+    printf("Add_dentry: Parent directory blocks:\n");
+    for (int i = 0; i < D_BLOCK; i++) {
+        printf("  blocks[%d] = %ld\n", i, dir_inode->blocks[i]);
+    }
+    
     if (!S_ISDIR(dir_inode->mode)) {
+        printf("Add_dentry: Error - parent is not a directory\n");
         return -ENOTDIR;
     }
 
@@ -647,76 +660,95 @@ int add_dentry(struct wfs_inode *dir_inode, const char *name, int inode_num) {
     new_entry.name[MAX_NAME_LEN - 1] = '\0';
     new_entry.num = inode_num;
 
-    int added = 0;
+    printf("Add_dentry: Parent directory current size: %ld bytes\n", dir_inode->size);
+    printf("Add_dentry: Checking existing blocks for free space...\n");
 
-    // First try to add to existing blocks
+    printf("Add_dentry: Directory has %d direct blocks\n", D_BLOCK);
+
+    // First, try to find space in existing blocks
+    for (int i = 0; i < D_BLOCK; i++) {
+        printf("Add_dentry: Checking block[%d] = %ld\n", i, dir_inode->blocks[i]);
+        if (dir_inode->blocks[i] != 0) {  // If this block exists
+            printf("Add_dentry: Examining block[%d] = %ld\n", i, dir_inode->blocks[i]);
+            
+            char block[BLOCK_SIZE];
+            if (read_data_block(dir_inode->blocks[i], block) != 0) {
+                printf("Add_dentry: Error reading data block %ld\n", dir_inode->blocks[i]);
+                return -EIO;
+            }
+
+            struct wfs_dentry *entries = (struct wfs_dentry *)block;
+            int entries_per_block = BLOCK_SIZE / sizeof(struct wfs_dentry);
+            printf("Add_dentry: Block can hold %d entries\n", entries_per_block);
+
+            // Look for a free slot
+            for (int j = 0; j < entries_per_block; j++) {
+                printf("Add_dentry: Checking slot %d (inode num: %d)\n", j, entries[j].num);
+                if (entries[j].num == -1) {  // Found a free slot
+                    printf("Add_dentry: Found free slot at index %d in block %d\n", j, i);
+                    entries[j] = new_entry;
+                    if (write_data_block(dir_inode->blocks[i], block) != 0) {
+                        printf("Add_dentry: Error writing to data block\n");
+                        return -EIO;
+                    }
+                    printf("Add_dentry: Successfully added entry to existing block\n");
+                    return 0;  // Successfully added to existing block
+                }
+            }
+            printf("Add_dentry: No free slots in block %d\n", i);
+        }
+    }
+
+    printf("Add_dentry: No free space in existing blocks, need to allocate new block\n");
+
+    // If we get here, we need a new block
     for (int i = 0; i < D_BLOCK; i++) {
         if (dir_inode->blocks[i] == 0) {
-            continue;
-        }
-        char block[BLOCK_SIZE];
-        if (read_data_block(dir_inode->blocks[i], block) != 0) {
-            return -EIO;
-        }
-        struct wfs_dentry *entries = (struct wfs_dentry *)block;
-        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-            if (entries[j].num == -1) {
-                // Found empty slot; add new entry
-                entries[j] = new_entry;
-                if (write_data_block(dir_inode->blocks[i], block) != 0) {
-                    return -EIO;
-                }
-                added = 1;
-                break;
+            printf("Add_dentry: Found empty block pointer at index %d\n", i);
+            
+            int block_num = allocate_data_block();
+            if (block_num < 0) {
+                printf("Add_dentry: Failed to allocate new data block\n");
+                return block_num;
             }
-        }
-        if (added) {
-            break;
-        }
-    }
+            printf("Add_dentry: Allocated new block %d\n", block_num);
 
-    // Only allocate new block if necessary
-    if (!added) {
-        for (int i = 0; i < D_BLOCK; i++) {
-            if (dir_inode->blocks[i] == 0) {
-                int block_num = allocate_data_block();
-                if (block_num < 0) {
-                    return block_num;
-                }
-                dir_inode->blocks[i] = block_num;
-                dir_inode->size += BLOCK_SIZE;
-
-                // Initialize block with all entries as -1
-                char block[BLOCK_SIZE];
-                memset(block, 0, BLOCK_SIZE);
-                struct wfs_dentry *entries = (struct wfs_dentry *)block;
-                for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-                    entries[j].num = -1;
-                }
-
-                // Add the new entry
-                entries[0] = new_entry;
-
-                if (write_data_block(block_num, block) != 0) {
-                    free_data_block(block_num);
-                    return -EIO;
-                }
-
-                if (write_inode(dir_inode) != 0) {
-                    return -EIO;
-                }
-
-                added = 1;
-                break;
+            char block[BLOCK_SIZE];
+            memset(block, 0, BLOCK_SIZE);
+            struct wfs_dentry *entries = (struct wfs_dentry *)block;
+            
+            // Initialize all entries as empty
+            int entries_per_block = BLOCK_SIZE / sizeof(struct wfs_dentry);
+            for (int j = 0; j < entries_per_block; j++) {
+                entries[j].num = -1;
             }
+            printf("Add_dentry: Initialized %d directory entries as empty\n", entries_per_block);
+
+            // Add our new entry in the first slot
+            entries[0] = new_entry;
+
+            if (write_data_block(block_num, block) != 0) {
+                printf("Add_dentry: Error writing new data block\n");
+                free_data_block(block_num);
+                return -EIO;
+            }
+
+            dir_inode->blocks[i] = block_num;
+            dir_inode->size += BLOCK_SIZE;
+            printf("Add_dentry: Updated directory size to %ld bytes\n", dir_inode->size);
+
+            if (write_inode(dir_inode) != 0) {
+                printf("Add_dentry: Error writing inode\n");
+                return -EIO;
+            }
+
+            printf("Add_dentry: Successfully added entry in new block\n");
+            return 0;
         }
     }
 
-    if (!added) {
-        return -ENOSPC;
-    }
-
-    return 0;
+    printf("Add_dentry: Error - no space left in directory\n");
+    return -ENOSPC;  // No space left
 }
 
 // Remove Directory Entry
@@ -968,10 +1000,6 @@ static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         return -ENOTDIR;
     }
 
-    // Add '.' and '..' entries
-    filler(buf, ".", NULL, 0);
-    filler(buf, "..", NULL, 0);
-
     // Check if directory has data blocks
     int has_blocks = 0;
     for (int i = 0; i < D_BLOCK; i++) {
@@ -982,23 +1010,24 @@ static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     }
 
     if (!has_blocks) {
-        // Empty directory
+        // Even an empty directory should have "." and ".." entries
+        filler(buf, ".", NULL, 0);
+        filler(buf, "..", NULL, 0);
         return 0;
     }
 
     // Iterate over direct blocks
     for (int i = 0; i < D_BLOCK; i++) {
-        if (dir_inode.blocks[i] == 0) {
-            continue;
-        }
-        char block[BLOCK_SIZE];
-        if (read_data_block(dir_inode.blocks[i], block) != 0) {
-            return -EIO;
-        }
-        struct wfs_dentry *entries = (struct wfs_dentry *)block;
-        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-            if (entries[j].num != -1) {
-                filler(buf, entries[j].name, NULL, 0);
+        if (dir_inode.blocks[i] != 0) {
+            char block[BLOCK_SIZE];
+            if (read_data_block(dir_inode.blocks[i], block) != 0) {
+                return -EIO;
+            }
+            struct wfs_dentry *entries = (struct wfs_dentry *)block;
+            for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+                if (entries[j].num != -1) {
+                    filler(buf, entries[j].name, NULL, 0);
+                }
             }
         }
     }
@@ -1101,12 +1130,13 @@ static int wfs_mkdir(const char *path, mode_t mode) {
     new_inode.mode = mode | S_IFDIR;
     new_inode.uid = getuid();
     new_inode.gid = getgid();
-    new_inode.size = 0; // No data blocks allocated yet
-    new_inode.nlinks = 2; // For '.' and '..'
+    new_inode.nlinks = 2;  // For '.' and '..'
     time_t now = time(NULL);
     new_inode.atim = now;
     new_inode.mtim = now;
     new_inode.ctim = now;
+    // No size or blocks allocated - we'll do that lazily
+    new_inode.size = 0;
 
     if (write_inode(&new_inode) != 0) {
         free_inode(inode_num);
@@ -1120,7 +1150,7 @@ static int wfs_mkdir(const char *path, mode_t mode) {
     }
 
     // Update parent inode
-    parent_inode.nlinks++; // Increase link count for new subdirectory
+    parent_inode.nlinks++;
     parent_inode.mtim = now;
     write_inode(&parent_inode);
 
