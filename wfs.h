@@ -40,6 +40,8 @@ struct wfs_sb {
     // Extend after this line
     int raid_mode; // helpds identify mode - "0", "1", "1v"
     int num_disks;
+    int raid_disk_ids[MAX_DISKS];
+    int own_disk_id;
 };
 
 // Inode

@@ -20,6 +20,8 @@
 // Global Variables
 void *disk_images[MAX_DISKS];
 size_t disk_sizes[MAX_DISKS];
+void *raid_disk_images[MAX_DISKS];
+size_t raid_disk_sizes[MAX_DISKS];
 int num_disks = 0;
 int raid_mode = 0; // 0: RAID 0, 1: RAID 1, 2: RAID 1v
 struct wfs_sb *superblock = NULL;
@@ -129,14 +131,18 @@ int main(int argc, char *argv[]) {
     return ret;
 }
 
-// Initialize Filesystem
+// Initialize Filesystem + remap disk images if needed
 int wfs_init(char **disk_paths, int num_disks_input) {
     int fd;
     struct stat sbuf;
 
     num_disks = num_disks_input;
 
-    // Open and map the disk images
+    // Temporary storage for disk orders based on own_disk_id
+    int input_disk_orders[MAX_DISKS];
+    memset(input_disk_orders, -1, sizeof(input_disk_orders));
+
+    // Open and map all disk images, and collect their own_disk_id
     for (int d = 0; d < num_disks; d++) {
         fd = open(disk_paths[d], O_RDWR);
         if (fd == -1) {
@@ -158,13 +164,27 @@ int wfs_init(char **disk_paths, int num_disks_input) {
             return -1;
         }
 
+        // Read the superblock to get own_disk_id
+        struct wfs_sb *disk_sb = (struct wfs_sb *)disk_images[d];
+        int own_id = disk_sb->own_disk_id;
+
+        if (own_id < 0 || own_id >= MAX_DISKS) {
+            fprintf(stderr, "Error: Invalid own_disk_id %d on disk %s.\n", own_id, disk_paths[d]);
+            munmap(disk_images[d], disk_sizes[d]);
+            close(fd);
+            return -1;
+        }
+
+        // Map own_disk_id to the index of the disk in disk_images
+        input_disk_orders[own_id] = d;
         close(fd);
     }
 
-    // Read superblock from first disk
-    superblock = (struct wfs_sb *)disk_images[0];
+    // Read the superblock from the first RAID disk (raid_disk_images[0]) to get the expected RAID order
+    // Initially, raid_disk_images is not populated. We'll populate it next.
+    superblock = (struct wfs_sb *)disk_images[input_disk_orders[0]];
 
-    // Verify the filesystem was created with the same number of disks
+    // Verify RAID mode and number of disks
     if (superblock->num_disks != num_disks) {
         fprintf(stderr, "Error: Disk count mismatch.\n");
         return -1;
@@ -180,12 +200,30 @@ int wfs_init(char **disk_paths, int num_disks_input) {
     num_inodes = superblock->num_inodes;
     num_data_blocks = superblock->num_data_blocks;
 
-    // Load inode bitmap (always mirrored, regardless of RAID mode)
-    inode_bitmap = (uint8_t *)disk_images[0] + superblock->i_bitmap_ptr;
+    // Create a mapping from raid_disk_ids to input disks
+    for (int sb_d = 0; sb_d < superblock->num_disks; sb_d++) {
+        int raid_id = superblock->raid_disk_ids[sb_d];
+        if (raid_id < 0 || raid_id >= MAX_DISKS) {
+            fprintf(stderr, "Error: Invalid RAID disk_id %d.\n", raid_id);
+            return -1;
+        }
 
-    // Load data bitmap only for RAID 1 and RAID 1v
+        int input_d = input_disk_orders[raid_id];
+        if (input_d == -1) {
+            fprintf(stderr, "Error: Disk with RAID disk_id %d not found among provided disks.\n", raid_id);
+            return -1;
+        }
+
+        // Assign the correctly ordered disk image to raid_disk_images
+        raid_disk_images[sb_d] = disk_images[input_d];
+        raid_disk_sizes[sb_d] = disk_sizes[input_d];
+    }
+
+    // Load inode and data bitmaps from the first RAID disk
+    inode_bitmap = (uint8_t *)raid_disk_images[0] + superblock->i_bitmap_ptr;
+
     if (raid_mode != 0) {
-        data_bitmap = (uint8_t *)disk_images[0] + superblock->d_bitmap_ptr;
+        data_bitmap = (uint8_t *)raid_disk_images[0] + superblock->d_bitmap_ptr;
     }
 
     // Initialize root directory
@@ -201,6 +239,7 @@ int wfs_init(char **disk_paths, int num_disks_input) {
 void wfs_destroy() {
     for (int d = 0; d < num_disks; d++) {
         munmap(disk_images[d], disk_sizes[d]);
+        munmap(raid_disk_images[d], raid_disk_sizes[d]);
     }
 }
 
@@ -210,7 +249,7 @@ int read_inode(int inode_num, struct wfs_inode *inode) {
         return -EINVAL;
     }
     off_t offset = superblock->i_blocks_ptr + inode_num * INODE_SIZE;
-    memcpy(inode, (char *)disk_images[0] + offset, sizeof(struct wfs_inode));
+    memcpy(inode, (char *)raid_disk_images[0] + offset, sizeof(struct wfs_inode));
     return 0;
 }
 
@@ -221,7 +260,7 @@ int write_inode(struct wfs_inode *inode) {
     }
     off_t offset = superblock->i_blocks_ptr + inode->num * INODE_SIZE;
     for (int d = 0; d < num_disks; d++) {
-        memcpy((char *)disk_images[d] + offset, inode, sizeof(struct wfs_inode));
+        memcpy((char *)raid_disk_images[d] + offset, inode, sizeof(struct wfs_inode));
     }
     return 0;
 }
@@ -254,9 +293,9 @@ int read_data_block(int block_num, void *buf) {
     }
 
     if (raid_mode == 0) { // RAID 0
-        memcpy(buf, (char *)disk_images[disk_num] + offset, BLOCK_SIZE);
+        memcpy(buf, (char *)raid_disk_images[disk_num] + offset, BLOCK_SIZE);
     } else if (raid_mode == 1) { // RAID 1
-        memcpy(buf, (char *)disk_images[0] + offset, BLOCK_SIZE);
+        memcpy(buf, (char *)raid_disk_images[0] + offset, BLOCK_SIZE);
     } else if (raid_mode == 2) { // RAID 1v
         char *blocks_data[MAX_DISKS];
         for (int d = 0; d < num_disks; d++) {
@@ -268,7 +307,7 @@ int read_data_block(int block_num, void *buf) {
                 }
                 return -ENOMEM;
             }
-            memcpy(blocks_data[d], (char *)disk_images[d] + offset, BLOCK_SIZE);
+            memcpy(blocks_data[d], (char *)raid_disk_images[d] + offset, BLOCK_SIZE);
         }
         // Majority voting
         int majority_count = 0;
@@ -304,10 +343,10 @@ int write_data_block(int block_num, void *buf) {
     }
 
     if (raid_mode == 0) { // RAID 0
-        memcpy((char *)disk_images[disk_num] + offset, buf, BLOCK_SIZE);
+        memcpy((char *)raid_disk_images[disk_num] + offset, buf, BLOCK_SIZE);
     } else { // RAID 1 and 1v
         for (int d = 0; d < num_disks; d++) {
-            memcpy((char *)disk_images[d] + offset, buf, BLOCK_SIZE);
+            memcpy((char *)raid_disk_images[d] + offset, buf, BLOCK_SIZE);
         }
     }
     return 0;
@@ -322,7 +361,7 @@ int allocate_inode() {
             inode_bitmap[i / 8] |= (1 << (i % 8));
             // Mirror to other disks
             for (int d = 1; d < num_disks; d++) {
-                uint8_t *ib = (uint8_t *)disk_images[d] + superblock->i_bitmap_ptr;
+                uint8_t *ib = (uint8_t *)raid_disk_images[d] + superblock->i_bitmap_ptr;
                 ib[i / 8] = inode_bitmap[i / 8];
             }
             return i;
@@ -343,7 +382,7 @@ int allocate_data_block() {
 
         if (raid_mode == 0) { // RAID 0
             // Access the data bitmap of the specific disk
-            uint8_t *current_data_bitmap = (uint8_t *)disk_images[disk_num] + superblock->d_bitmap_ptr;
+            uint8_t *current_data_bitmap = (uint8_t *)raid_disk_images[disk_num] + superblock->d_bitmap_ptr;
             uint8_t byte = current_data_bitmap[i / 8];
             if ((byte & (1 << (i % 8))) == 0) {
                 // Mark data block as allocated
@@ -358,7 +397,7 @@ int allocate_data_block() {
                 data_bitmap[i / 8] |= (1 << (i % 8));
                 // Mirror to other disks
                 for (int d = 1; d < num_disks; d++) {
-                    uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
+                    uint8_t *db = (uint8_t *)raid_disk_images[d] + superblock->d_bitmap_ptr;
                     db[i / 8] = data_bitmap[i / 8];
                 }
                 printf("Allocated data block %d\n", i);  // Debug output
@@ -459,7 +498,7 @@ void free_inode(int inode_num) {
     inode_bitmap[inode_num / 8] &= ~(1 << (inode_num % 8));
     // Mirror to other disks
     for (int d = 1; d < num_disks; d++) {
-        uint8_t *ib = (uint8_t *)disk_images[d] + superblock->i_bitmap_ptr;
+        uint8_t *ib = (uint8_t *)raid_disk_images[d] + superblock->i_bitmap_ptr;
         ib[inode_num / 8] = inode_bitmap[inode_num / 8];
     }
 }
@@ -478,14 +517,14 @@ void free_data_block(int block_num) {
 
     if (raid_mode == 0) { // RAID 0
         // Access the data bitmap of the specific disk
-        uint8_t *current_data_bitmap = (uint8_t *)disk_images[disk_num] + superblock->d_bitmap_ptr;
+        uint8_t *current_data_bitmap = (uint8_t *)raid_disk_images[disk_num] + superblock->d_bitmap_ptr;
         current_data_bitmap[block_num / 8] &= ~(1 << (block_num % 8));
         // No mirroring in RAID 0
     } else { // RAID 1 and RAID 1v
         data_bitmap[block_num / 8] &= ~(1 << (block_num % 8));
         // Mirror to other disks
         for (int d = 1; d < num_disks; d++) {
-            uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
+            uint8_t *db = (uint8_t *)raid_disk_images[d] + superblock->d_bitmap_ptr;
             db[block_num / 8] = data_bitmap[block_num / 8];
         }
     }

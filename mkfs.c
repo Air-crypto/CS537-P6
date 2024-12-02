@@ -155,6 +155,9 @@ int wfs_mkfs(int raid_mode, char **diskimgs, int num_disks, int inodes, int bloc
             return -1; // Runtime error
         }
 
+        // Set disk number in superblock - disk specific order
+        sb.own_disk_id = i;
+
         // Write the superblock to the disk
         lseek(fd, 0, SEEK_SET);
         if (write(fd, &sb, sizeof(struct wfs_sb)) != sizeof(struct wfs_sb)) {
@@ -244,6 +247,11 @@ int setup_sb(struct wfs_sb *sb, int raid_mode, int num_disks, int inodes, int bl
     // Add RAID configuration to superblock
     sb->raid_mode = raid_mode;
     sb->num_disks = num_disks;
+
+    // Assign unique indexes to each disk
+    for (int d = 0; d < num_disks; d++) {
+        sb->raid_disk_ids[d] = d; // Assigning index d to disk d
+    }
 
     // Verify disk size sufficiency
     off_t total_size_needed = sb->d_blocks_ptr + data_blocks_size;
