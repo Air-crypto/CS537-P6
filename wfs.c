@@ -506,47 +506,50 @@ int initialize_root_directory() {
         return -EIO;
     }
 
+    // DONT DO THIS ANYMORE - LAZY ALLOCATION
     // Allocate a data block for the root directory if not already allocated
-    if (root_inode.blocks[0] == 0) {
-        int block_num = allocate_data_block();
-        if (block_num < 0) {
-            fprintf(stderr, "Error: Cannot allocate data block for root directory.\n");
-            return block_num;
-        }
-        root_inode.blocks[0] = block_num;
-        // We'll set size to BLOCK_SIZE since we're using one full block
-        root_inode.size = BLOCK_SIZE;
-
-        // Initialize block with all entries marked as available (-1)
-        char block[BLOCK_SIZE];
-        memset(block, 0, BLOCK_SIZE);
-        struct wfs_dentry *entries = (struct wfs_dentry *)block;
-        
-        // Mark all entries as available
-        for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
-            entries[j].num = -1;
-        }
-
-        if (write_data_block(block_num, block) != 0) {
-            fprintf(stderr, "Error: Cannot write root directory entries.\n");
-            free_data_block(block_num);
-            return -EIO;
-        }
-
-        root_inode.nlinks = 2;  // '.' and '..'
-        root_inode.mtim = time(NULL);
-        root_inode.ctim = time(NULL);
-
-        if (write_inode(&root_inode) != 0) {
-            fprintf(stderr, "Error: Cannot update root inode.\n");
-            free_data_block(block_num);
-            return -EIO;
-        }
-
-        printf("Root directory initialized with size %ld bytes\n", root_inode.size);
-
-        printf("Root directory initialized: inode 0, block %ld, size %ld\n", root_inode.blocks[0], root_inode.size);
+    //if (root_inode.blocks[0] == 0) {
+    /*
+    int block_num = allocate_data_block();
+    if (block_num < 0) {
+        fprintf(stderr, "Error: Cannot allocate data block for root directory.\n");
+        return block_num;
     }
+    root_inode.blocks[0] = block_num;
+    // We'll set size to BLOCK_SIZE since we're using one full block
+    root_inode.size = BLOCK_SIZE;
+
+    // Initialize block with all entries marked as available (-1)
+    char block[BLOCK_SIZE];
+    memset(block, 0, BLOCK_SIZE);
+    struct wfs_dentry *entries = (struct wfs_dentry *)block;
+    
+    // Mark all entries as available
+    for (int j = 0; j < BLOCK_SIZE / sizeof(struct wfs_dentry); j++) {
+        entries[j].num = -1;
+    }
+
+    if (write_data_block(block_num, block) != 0) {
+        fprintf(stderr, "Error: Cannot write root directory entries.\n");
+        free_data_block(block_num);
+        return -EIO;
+    }
+    */
+
+    root_inode.nlinks = 2;  // '.' and '..'
+    root_inode.mtim = time(NULL);
+    root_inode.ctim = time(NULL);
+
+    if (write_inode(&root_inode) != 0) {
+        fprintf(stderr, "Error: Cannot update root inode.\n");
+        //free_data_block(block_num);
+        return -EIO;
+    }
+
+    printf("Root directory initialized with size %ld bytes\n", root_inode.size);
+
+    printf("Root directory initialized: inode 0, block %ld, size %ld\n", root_inode.blocks[0], root_inode.size);
+    //}
 
     return 0;
 }
