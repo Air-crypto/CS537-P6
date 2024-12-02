@@ -663,7 +663,7 @@ void split_path(const char *path, char *parent, char *name) {
     }
 }
 
-// Adjusted find_dentry function
+// Find directory entry function
 int find_dentry(struct wfs_inode *dir_inode, const char *name, struct wfs_dentry *dentry) {
     if (!S_ISDIR(dir_inode->mode)) {
         return -ENOTDIR;
@@ -1054,7 +1054,7 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
     return bytes_written;
 }
 
-// Adjusted wfs_readdir function
+// Read directory function
 static int wfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
     (void) offset;
     (void) fi;
@@ -1165,7 +1165,7 @@ static int wfs_mknod(const char *path, mode_t mode, dev_t dev) {
     return 0;
 }
 
-// Adjusted wfs_mkdir function
+// Make directory function
 static int wfs_mkdir(const char *path, mode_t mode) {
     char parent_path[MAX_PATH_LEN];
     char name[MAX_NAME_LEN];
