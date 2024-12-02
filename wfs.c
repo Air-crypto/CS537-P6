@@ -180,9 +180,13 @@ int wfs_init(char **disk_paths, int num_disks_input) {
     num_inodes = superblock->num_inodes;
     num_data_blocks = superblock->num_data_blocks;
 
-    // Load inode and data bitmaps
+    // Load inode bitmap (always mirrored, regardless of RAID mode)
     inode_bitmap = (uint8_t *)disk_images[0] + superblock->i_bitmap_ptr;
-    data_bitmap = (uint8_t *)disk_images[0] + superblock->d_bitmap_ptr;
+
+    // Load data bitmap only for RAID 1 and RAID 1v
+    if (raid_mode != 0) {
+        data_bitmap = (uint8_t *)disk_images[0] + superblock->d_bitmap_ptr;
+    }
 
     // Initialize root directory
     if (initialize_root_directory() != 0) {
@@ -235,7 +239,7 @@ int get_data_block_offset(int block_num, int *disk_num, off_t *offset) {
         return 0;
     } else { // RAID 1 and 1v
         *disk_num = -1; // All disks
-        *offset = superblock->d_blocks_ptr + block_num * BLOCK_SIZE;
+        *offset = superblock->d_blocks_ptr + block_num * BLOCK_SIZE; 
         return 0;
     }
 }
@@ -331,17 +335,35 @@ int allocate_inode() {
 int allocate_data_block() {
     // Start from 1 to avoid using block 0, but go up to and including num_data_blocks
     for (int i = 1; i <= num_data_blocks; i++) {
-        uint8_t byte = data_bitmap[i / 8];
-        if ((byte & (1 << (i % 8))) == 0) {
-            // Mark data block as allocated
-            data_bitmap[i / 8] |= (1 << (i % 8));
-            // Mirror to other disks
-            for (int d = 1; d < num_disks; d++) {
-                uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
-                db[i / 8] = data_bitmap[i / 8];
+        int disk_num;
+        off_t offset;
+        if (get_data_block_offset(i, &disk_num, &offset) != 0) {
+            return -EINVAL;
+        }
+
+        if (raid_mode == 0) { // RAID 0
+            // Access the data bitmap of the specific disk
+            uint8_t *current_data_bitmap = (uint8_t *)disk_images[disk_num] + superblock->d_bitmap_ptr;
+            uint8_t byte = current_data_bitmap[i / 8];
+            if ((byte & (1 << (i % 8))) == 0) {
+                // Mark data block as allocated
+                current_data_bitmap[i / 8] |= (1 << (i % 8));
+                // No mirroring in RAID 0
+                return i;
             }
-            printf("Allocated data block %d\n", i);  // Debug output
-            return i;
+        } else { // RAID 1 and RAID 1v
+            uint8_t byte = data_bitmap[i / 8];
+            if ((byte & (1 << (i % 8))) == 0) {
+                // Mark data block as allocated
+                data_bitmap[i / 8] |= (1 << (i % 8));
+                // Mirror to other disks
+                for (int d = 1; d < num_disks; d++) {
+                    uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
+                    db[i / 8] = data_bitmap[i / 8];
+                }
+                printf("Allocated data block %d\n", i);  // Debug output
+                return i;
+            }
         }
     }
     return -ENOSPC;
@@ -447,11 +469,25 @@ void free_data_block(int block_num) {
     if (block_num < 0 || block_num >= num_data_blocks) {
         return;
     }
-    data_bitmap[block_num / 8] &= ~(1 << (block_num % 8));
-    // Mirror to other disks
-    for (int d = 1; d < num_disks; d++) {
-        uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
-        db[block_num / 8] = data_bitmap[block_num / 8];
+
+    int disk_num;
+    off_t offset;
+    if (get_data_block_offset(block_num, &disk_num, &offset) != 0) {
+        return;
+    }
+
+    if (raid_mode == 0) { // RAID 0
+        // Access the data bitmap of the specific disk
+        uint8_t *current_data_bitmap = (uint8_t *)disk_images[disk_num] + superblock->d_bitmap_ptr;
+        current_data_bitmap[block_num / 8] &= ~(1 << (block_num % 8));
+        // No mirroring in RAID 0
+    } else { // RAID 1 and RAID 1v
+        data_bitmap[block_num / 8] &= ~(1 << (block_num % 8));
+        // Mirror to other disks
+        for (int d = 1; d < num_disks; d++) {
+            uint8_t *db = (uint8_t *)disk_images[d] + superblock->d_bitmap_ptr;
+            db[block_num / 8] = data_bitmap[block_num / 8];
+        }
     }
 }
 
